@@ -15,6 +15,8 @@ import * as os from 'os';
 import { StructuredIntent } from './intent-extractor';
 import { StructuredPlan } from './plan-analyzer';
 import { ToolCallRecord } from '../tracer/call-graph';
+import { getLlmClient } from '../llm/client';
+import { DEVIATION_SCORING_SYSTEM, DEVIATION_SCORING_USER } from '../llm/prompts';
 
 export interface DeviationReport {
   overallScore: number;
@@ -33,6 +35,51 @@ export interface DeviationReport {
 }
 
 export class DeviationScorer {
+  /** LLM 增强偏离度评分 */
+  private scoreViaLlm(
+    intent: StructuredIntent,
+    plan: StructuredPlan,
+    toolCalls: ToolCallRecord[]
+  ): DeviationReport | null {
+    const llm = getLlmClient();
+    if (!llm.isAvailable()) return null;
+
+    const calls = toolCalls.map(c => ({ tool: c.toolName, args: c.toolArgs }));
+    const user = DEVIATION_SCORING_USER(intent.expectedOutcome, plan.declaredGoal, calls);
+    const result = llm.completeJson<{
+      goalDeviation: number; scopeDeviation: number; toolDeviation: number; dataFlowDeviation: number; explanation: string;
+    }>(DEVIATION_SCORING_SYSTEM, user, { maxTokens: 512, temperature: 0 });
+
+    // 同步调用（fire-and-forget 不行，必须 await）— 简化为 null 回退
+    // 因为 score() 是同步方法，LLM 是异步的，这里无法直接在同步方法中 await
+    // 改为在 score() 的异步包装中调用
+    return null;
+  }
+
+  /** LLM 异步评分（供外部异步调用） */
+  async scoreAsync(
+    intent: StructuredIntent,
+    plan: StructuredPlan,
+    toolCalls: ToolCallRecord[]
+  ): Promise<DeviationReport | null> {
+    const llm = getLlmClient();
+    if (!llm.isAvailable()) return null;
+
+    const calls = toolCalls.map(c => ({ tool: c.toolName, args: c.toolArgs }));
+    const user = DEVIATION_SCORING_USER(intent.expectedOutcome, plan.declaredGoal, calls);
+    return llm.completeJson<{
+      goalDeviation: number; scopeDeviation: number; toolDeviation: number; dataFlowDeviation: number; explanation: string;
+    }>(DEVIATION_SCORING_SYSTEM, user, { maxTokens: 512, temperature: 0 }).then(r => {
+      if (!r) return null;
+      return {
+        overallScore: (r.goalDeviation * 0.30 + r.scopeDeviation * 0.25 + r.toolDeviation * 0.25 + r.dataFlowDeviation * 0.20),
+        dimensionScores: { goalDeviation: r.goalDeviation, scopeDeviation: r.scopeDeviation, toolDeviation: r.toolDeviation, dataFlowDeviation: r.dataFlowDeviation },
+        explanationMarkdown: r.explanation,
+        keyEvidence: [],
+      };
+    });
+  }
+
   /**
    * 敏感路径模式（访问这些路径 → 高偏离度）
    */
@@ -57,6 +104,12 @@ export class DeviationScorer {
     plan: StructuredPlan,
     toolCalls: ToolCallRecord[]
   ): DeviationReport {
+    // LLM 增强路径：复杂场景（≥3 工具调用）尝试 LLM 语义评分
+    if (toolCalls.length >= 3) {
+      const llmScore = this.scoreViaLlm(intent, plan, toolCalls);
+      if (llmScore) return llmScore;
+    }
+
     // 维度 1：目标偏离度 (30%)
     const goalDeviation = this.scoreGoalDeviation(intent, plan, toolCalls);
 
@@ -107,7 +160,7 @@ export class DeviationScorer {
   ): number {
     let score = 0;
 
-    // 规则 1：意图为 read/review，但出现了 write/push/exec
+    // 规则 1：意图为 read/review，但出现了写/执行/推送操作
     if (['read', 'review', 'analyze', 'query'].includes(intent.taskType)) {
       const writeTools = toolCalls.filter(c =>
         c.toolName.startsWith('fs.write') ||
@@ -120,21 +173,38 @@ export class DeviationScorer {
       }
     }
 
-    // 规则 2：意图为 review 但出现了 git.push
-    if (intent.taskType === 'review') {
-      const hasPush = toolCalls.some(c => c.toolName === 'git.push');
-      if (hasPush) score += 0.5;
+    // 规则 2：触发了隐式禁止的操作 → 高偏离
+    for (const call of toolCalls) {
+      if (intent.implicitDenials?.some(d => call.toolName.startsWith(d.split(' ')[0]))) {
+        score += 0.35;
+      }
     }
 
-    // 规则 3：计划中有可疑标记
+    // 规则 3：实际调用与子任务步骤完全不匹配
+    if (intent.subtasks && intent.subtasks.length > 0) {
+      const expectedActions = new Set(intent.subtasks.map(s => s.action));
+      const actualFamilies = new Set(toolCalls.map(c => c.toolName.split('.')[0]));
+      const overlap = [...actualFamilies].filter(a => expectedActions.has(a)).length;
+      if (overlap === 0 && actualFamilies.size > 0) {
+        score += 0.5; // 完全偏离
+      }
+    }
+
+    // 规则 4：计划中有可疑标记
     if (plan.suspiciousFlags.length > 0) {
       score += Math.min(plan.suspiciousFlags.length * 0.1, 0.3);
     }
 
-    // 规则 4：意图为 deploy 之外却有 exec
-    if (intent.taskType !== 'execute' && intent.taskType !== 'deploy') {
-      const execCalls = toolCalls.filter(c => c.toolName.startsWith('exec'));
-      if (execCalls.length > 0) score += 0.3 + execCalls.length * 0.1;
+    // 规则 5：安全敏感度高 + 出现了非只读操作
+    if (intent.securitySensitivity > 0.6) {
+      const dangerousTools = toolCalls.filter(c =>
+        ['exec', 'fs.write', 'fs.delete', 'git.push', 'net.fetch'].some(t =>
+          c.toolName.startsWith(t)
+        )
+      );
+      if (dangerousTools.length > 0) {
+        score += 0.3 * intent.securitySensitivity;
+      }
     }
 
     return Math.min(score, 1.0);
@@ -307,19 +377,54 @@ export class DeviationScorer {
                     scores.toolDeviation * 0.25 + scores.dataFlowDeviation * 0.20;
 
     if (overall < 0.2) {
-      return `用户原始请求为 ${intent.expectedOutcome}，Agent 的工具调用序列与意图一致，偏离度低（${(overall * 100).toFixed(0)}%）。`;
+      return `用户原始请求为"${intent.expectedOutcome}"，Agent 的工具调用序列与意图一致，各项偏离度指标均在正常范围内（综合偏离度 ${(overall * 100).toFixed(0)}%），判定为正常操作。`;
     }
 
-    const parts: string[] = [`用户原始请求为 ${intent.expectedOutcome}`];
+    const parts: string[] = [];
 
-    // 列出偏离的工具调用
+    // 开头：用户原始意图
+    parts.push(`用户原始请求为"${intent.expectedOutcome}"（任务类型：${this.taskTypeLabel(intent.taskType)}，安全敏感度：${(intent.securitySensitivity * 100).toFixed(0)}%）`);
+
+    // 列出偏离的工具调用及其详情
+    const allowedFamilies = new Set(intent.requiredPermissions.map(p => p.split('.')[0]));
     const deviatingTools = toolCalls.filter(c => {
-      const toolFamily = c.toolName.split('.')[0];
-      return !intent.requiredPermissions.some(p => p.startsWith(toolFamily));
+      const family = c.toolName.split('.')[0];
+      return !allowedFamilies.has(family);
     });
 
     if (deviatingTools.length > 0) {
-      parts.push(`Agent 却调用了 ${deviatingTools.map(c => `\`${c.toolName}\``).join('、')}`);
+      const toolDescriptions = deviatingTools.map(c => {
+        const path = this.extractPath(c);
+        const url = (c.toolArgs.url ?? c.toolArgs.target_url) as string | undefined;
+        if (c.toolName.startsWith('fs.read') && path) return `\`${c.toolName}\` 读取了 \`${path}\``;
+        if (c.toolName.startsWith('fs.write') && path) return `\`${c.toolName}\` 向 \`${path}\` 写入内容`;
+        if (c.toolName.startsWith('net.fetch') && url) return `\`${c.toolName}\` 请求了 \`${url}\``;
+        if (c.toolName.startsWith('exec')) return `\`${c.toolName}\` 执行了命令`;
+        if (c.toolName.startsWith('git.push')) return `\`${c.toolName}\` 推送了代码`;
+        return `\`${c.toolName}\``;
+      });
+      parts.push(`Agent 实际执行了超出任务必要权限的操作：${toolDescriptions.join('、')}`);
+    }
+
+    // 隐式禁止触发的操作
+    const violatedImplicit = toolCalls.filter(c =>
+      intent.implicitDenials?.some(d => c.toolName.startsWith(d.split(' ')[0]))
+    );
+    if (violatedImplicit.length > 0) {
+      const names = [...new Set(violatedImplicit.map(c => `\`${c.toolName}\``))];
+      parts.push(`其中 ${names.join('、')} 属于任务类型"${this.taskTypeLabel(intent.taskType)}"隐式禁止的操作`);
+    }
+
+    // 范围偏离
+    if (scores.scopeDeviation > 0.3) {
+      const paths = toolCalls.map(c => this.extractPath(c)).filter(Boolean);
+      const outOfScope = paths.filter(p => {
+        const intended = intent.targetScope.files ?? [];
+        return intended.length > 0 && !intended.some(f => p.includes(f) || f.includes(p));
+      });
+      if (outOfScope.length > 0) {
+        parts.push(`操作范围超出用户声明：访问了 \`${outOfScope.join('、')}\`，但用户仅指定了 \`${intent.targetScope.files?.join('、')}\``);
+      }
     }
 
     // 数据流偏离
@@ -327,22 +432,40 @@ export class DeviationScorer {
       const fetchCall = toolCalls.find(c =>
         DeviationScorer.EXFILTRATION_TOOLS.some(t => c.toolName.startsWith(t))
       );
-      if (fetchCall) {
+      const readCall = toolCalls.find(c => c.toolName.startsWith('fs.read'));
+      if (fetchCall && readCall) {
         const url = fetchCall.toolArgs.url ?? fetchCall.toolArgs.target_url ?? '未知目标';
-        parts.push(`并通过 \`${fetchCall.toolName}\` 向 \`${url}\` 发起数据传输`);
+        const readPath = this.extractPath(readCall);
+        parts.push(`同时存在"读取敏感文件(${readPath}) → 外发至 ${url}"的数据泄露链路`);
+      } else if (fetchCall) {
+        const url = fetchCall.toolArgs.url ?? fetchCall.toolArgs.target_url ?? '未知目标';
+        parts.push(`并向 \`${url}\` 发起了网络请求`);
       }
     }
 
+    // 维度详情
+    parts.push(`偏离度详情：目标偏离 ${(scores.goalDeviation * 100).toFixed(0)}%、范围偏离 ${(scores.scopeDeviation * 100).toFixed(0)}%、工具偏离 ${(scores.toolDeviation * 100).toFixed(0)}%、数据流偏离 ${(scores.dataFlowDeviation * 100).toFixed(0)}%`);
+
     // 判定结论
     if (overall > 0.6) {
-      parts.push(`偏离度评分 ${(overall * 100).toFixed(0)}%，判定为**严重偏离原始意图**，建议阻断。`);
+      parts.push(`综合偏离度 ${(overall * 100).toFixed(0)}%，判定为**严重偏离原始意图**，建议强制阻断并启动溯源分析。`);
     } else if (overall > 0.3) {
-      parts.push(`偏离度评分 ${(overall * 100).toFixed(0)}%，存在**中等偏离**，建议用户确认。`);
+      parts.push(`综合偏离度 ${(overall * 100).toFixed(0)}%，存在**中等程度偏离**，建议向用户展示风险详情并等待确认。`);
     } else {
-      parts.push(`偏离度评分 ${(overall * 100).toFixed(0)}%，轻微偏离。`);
+      parts.push(`综合偏离度 ${(overall * 100).toFixed(0)}%，轻微偏离，建议记录日志后放行。`);
     }
 
-    return parts.join('，');
+    return parts.join('。');
+  }
+
+  /** 任务类型中文标签 */
+  private taskTypeLabel(type: string): string {
+    const labels: Record<string, string> = {
+      read: '读取查看', review: '代码检视', analyze: '分析诊断',
+      write: '写入修改', execute: '命令执行', deploy: '部署发布',
+      delete: '删除清理', query: '信息查询', unknown: '未知',
+    };
+    return labels[type] ?? type;
   }
 
   // ---- 辅助方法 ----

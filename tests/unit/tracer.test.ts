@@ -101,12 +101,13 @@ describe('DagRenderer', () => {
             toolArgs: { url: 'evil.com' }, isSuspicious: true,
             sourceAttribution: { type: 'mcp_response', sourceId: '2', sourceSnippet: '' },
           },
-          children: [], isAttackSource: true, isAnomalous: true,
+          children: [], isAttackSource: true, isAnomalous: true, depth: 1, role: 'sub-agent' as const,
         }],
-        isAttackSource: false, isAnomalous: false,
+        isAttackSource: false, isAnomalous: false, depth: 0, role: 'agent' as const,
       },
       totalNodes: 2, suspiciousNodes: 1, attackSources: [],
       impactedResources: { files: [], networkTargets: [], gitRepos: [], credentials: [] },
+      attackChainSummary: '', mermaidCode: '', timelineNodes: [],
     };
   }
 

@@ -13,6 +13,12 @@
 import { DirectInjectionDetector } from './direct-injection';
 import { IndirectInjectionDetector } from './indirect-injection';
 import { MemoryPoisoningDetector } from './memory-poisoning';
+import { SemanticAnalyzer } from './semantic-analyzer';
+import { ContentParser, ParsedContent } from './content-parser';
+import { VectorAnalyzer } from './vector-analyzer';
+import { MemoryMonitor } from './memory-monitor';
+import { getLlmClient } from '../llm/client';
+import { INJECTION_ANALYSIS_SYSTEM, INJECTION_ANALYSIS_USER } from '../llm/prompts';
 
 export interface DetectionInput {
   source: 'user_input' | 'external_resource' | 'memory' | 'mcp_response' | 'tool_description';
@@ -39,6 +45,10 @@ export class DetectionEngine {
   private directDetector: DirectInjectionDetector;
   private indirectDetector: IndirectInjectionDetector;
   private memoryDetector: MemoryPoisoningDetector;
+  private semanticAnalyzer: SemanticAnalyzer;
+  private contentParser: ContentParser;
+  private vectorAnalyzer: VectorAnalyzer;
+  private memoryMonitor: MemoryMonitor;
 
   /** 已检测过的内容缓存（相同内容不重复检测） */
   private cache: Map<string, DetectionResult> = new Map();
@@ -48,7 +58,18 @@ export class DetectionEngine {
     this.directDetector = new DirectInjectionDetector();
     this.indirectDetector = new IndirectInjectionDetector();
     this.memoryDetector = new MemoryPoisoningDetector();
+    this.semanticAnalyzer = new SemanticAnalyzer();
+    this.contentParser = new ContentParser();
+    this.vectorAnalyzer = new VectorAnalyzer();
+    this.memoryMonitor = new MemoryMonitor(this);
   }
+
+  /** 获取记忆监控器（供外部调用） */
+  getMemoryMonitor(): MemoryMonitor { return this.memoryMonitor; }
+  /** 获取向量分析器 */
+  getVectorAnalyzer(): VectorAnalyzer { return this.vectorAnalyzer; }
+  /** 获取内容解析器 */
+  getContentParser(): ContentParser { return this.contentParser; }
 
   /**
    * 三级级联检测主入口
@@ -73,13 +94,12 @@ export class DetectionEngine {
     const detectionResults = await this.runDetectors(normalized, input);
 
     // 取最高置信度的结果
-    const bestResult = detectionResults.reduce((best, curr) =>
+    let bestResult = detectionResults.reduce((best, curr) =>
       curr.confidence > best.confidence ? curr : best
     );
 
     // 如果置信度足够高，直接返回
     if (bestResult.confidence > 0.8) {
-      // 合并第一级的规则匹配信息
       if (ruleResult && ruleResult.bypassTechniques.length > 0) {
         bestResult.bypassTechniques = [
           ...new Set([...bestResult.bypassTechniques, ...ruleResult.bypassTechniques]),
@@ -87,6 +107,79 @@ export class DetectionEngine {
       }
       this.cacheResult(cacheKey, bestResult);
       return bestResult;
+    }
+
+    // ---- 第二级半A：多格式解析 + 分层检测（增强间接注入） ----
+    if (input.source === 'external_resource' || input.source === 'mcp_response' ||
+        input.source === 'tool_description') {
+      // 解析内容格式，提取各层级
+      const parsed = this.contentParser.parse(normalized, input.metadata.toolName);
+
+      if (parsed.hasSuspiciousFeatures) {
+        // 对隐藏层级进行专门检测
+        const hiddenLayers = parsed.layers.filter(l => l.isHidden);
+        for (const layer of hiddenLayers) {
+          const layerResult = await this.indirectDetector.detect({
+            ...input,
+            content: layer.content,
+            source: 'external_resource',
+          });
+          if (layerResult.isInjection && layerResult.confidence > bestResult.confidence) {
+            bestResult = {
+              ...layerResult,
+              bypassTechniques: [...new Set([...bestResult.bypassTechniques, 'hidden-layer', `format:${parsed.format}`])],
+            };
+          }
+        }
+
+        // 如果发现可疑特征但检测器没抓到，提升置信度
+        if (!bestResult.isInjection && parsed.suspiciousFeatures.length >= 2) {
+          bestResult.confidence = Math.max(bestResult.confidence, 0.4);
+        }
+      }
+
+      // 对于 JSON/HTML，对所有层合并检测
+      if (parsed.format === 'html' || parsed.format === 'json') {
+        const allLayers = parsed.layers.map(l => l.content).join('\n');
+        if (allLayers !== normalized) {
+          const formatResult = await this.indirectDetector.detect({
+            ...input,
+            content: allLayers,
+            source: 'external_resource',
+          });
+          if (formatResult.isInjection && formatResult.confidence > bestResult.confidence) {
+            bestResult = { ...formatResult, bypassTechniques: [...bestResult.bypassTechniques, `format:${parsed.format}`] };
+          }
+        }
+      }
+    }
+
+    // ---- 第二级半B：深度语义分析（增强间接注入和记忆污染检测） ----
+    if (input.source === 'external_resource' || input.source === 'mcp_response' ||
+        input.source === 'tool_description' || input.source === 'memory') {
+      const semanticResult = this.semanticAnalyzer.analyze(
+        normalized,
+        input.source === 'memory' ? 'data' : 'data',
+        input.source === 'mcp_response' ? 'api_response' : undefined
+      );
+
+      if (semanticResult.confidence > 0.5) {
+        // 语义分析发现异常，提升置信度
+        const enhanced: DetectionResult = {
+          ...bestResult,
+          isInjection: true,
+          confidence: Math.max(bestResult.confidence, semanticResult.confidence),
+          injectionType: input.source === 'memory' ? 'memory_poisoning' : 'indirect',
+          payloadSnippet: semanticResult.payloadSnippet || bestResult.payloadSnippet,
+          payloadLocation: semanticResult.payloadLocation,
+          bypassTechniques: [...new Set([...bestResult.bypassTechniques, 'semantic-analyzed'])],
+        };
+        if (enhanced.confidence > 0.7) {
+          this.cacheResult(cacheKey, enhanced);
+          return enhanced;
+        }
+        bestResult.confidence = Math.max(bestResult.confidence, semanticResult.confidence * 0.7);
+      }
     }
 
     // ---- 第三级：LLM 深度研判 ----
@@ -152,11 +245,23 @@ export class DetectionEngine {
   preprocess(content: string): string {
     let normalized = content;
 
-    // 1. 剥离零宽字符 + 方向覆盖字符
-    normalized = normalized.replace(/[​‌‍﻿⁠‪-‮]/g, '');
+    // 1. 剥离零宽字符 + 方向覆盖字符 + 软连字符
+    normalized = normalized.replace(/[​‌‍﻿⁠‪-‮­]/g, '');  // includes U+00AD (soft hyphen)
+    // 1b. 组合字符分解 (NFD) + 剥离变音符号 → 基础字符
+    normalized = normalized.normalize('NFD').replace(/[̀-ͯ᪰-᫿]/g, '');
 
     // 2. 全角→半角转换
     normalized = this.fullwidthToHalfwidth(normalized);
+
+    // 2b. 单词间单字符间隔归一化 ("I g n o r e" → "Ignore")
+    const spacedWordPattern = (len: number) => {
+      const parts = Array.from({length: len}, () => '(\\w)');
+      return new RegExp('\\b' + parts.join('\\s+') + '\\b', 'g');
+    };
+    for (let len = 7; len >= 4; len--) {
+      const re = spacedWordPattern(len);
+      normalized = normalized.replace(re, (_full: string, ...chars: string[]) => chars.slice(0, len).join(''));
+    }
 
     // 3. 基本同形字还原 (use \uXXXX for portability)
     normalized = normalized
@@ -209,6 +314,13 @@ export class DetectionEngine {
       // 敏感文件访问 + 外发组合
       { pattern: /rm\s+-rf\s+\/\s*\*/i, type: 'direct', confidence: 0.99 },
       { pattern: /rm\s+-rf\s+\//i, type: 'direct', confidence: 0.99 },
+      // PDF 恶意特征
+      { pattern: /\/OpenAction\s/i, type: 'indirect', confidence: 0.92 },
+      { pattern: /\/JavaScript\s/i, type: 'indirect', confidence: 0.92 },
+      { pattern: /\/Launch\s/i, type: 'indirect', confidence: 0.90 },
+      // Memory/system override tags
+      { pattern: /<system>[\s\S]*?<\/system>/i, type: 'memory_poisoning', confidence: 0.95 },
+      { pattern: /\[HIDDEN\][\s\S]*?\[\/HIDDEN\]/i, type: 'memory_poisoning', confidence: 0.93 },
       { pattern: /dd\s+if=.*of=\/dev\/sd/i, type: 'direct', confidence: 0.99 },
       // 编码混淆执行
       { pattern: /echo\s+\S+\s*\|\s*base64\s+.*\|\s*(bash|sh)/i, type: 'direct', confidence: 0.97 },
@@ -292,13 +404,29 @@ export class DetectionEngine {
    * 当前为 stub——Sprint 3 中接入 Claude API。
    */
   private async llmDeepAnalyze(content: string, input: DetectionInput): Promise<DetectionResult | null> {
-    // TODO: Sprint 3 — 接入 Claude API 进行深度语义分析
-    // const prompt = buildInjectionPrompt(content, input.source);
-    // const response = await llmClient.complete(prompt);
-    // return parseDetectionResponse(response);
+    const llm = getLlmClient();
+    if (!llm.isAvailable()) return null;
 
-    // 当前：如果前两级置信度在灰色区域，默认返回不确定
-    return null;
+    const system = INJECTION_ANALYSIS_SYSTEM;
+    const user = INJECTION_ANALYSIS_USER(content, input.source);
+
+    const result = await llm.completeJson<{
+      isInjection: boolean;
+      injectionType: 'direct' | 'indirect' | 'memory_poisoning' | 'none';
+      confidence: number;
+      payloadSnippet: string;
+    }>(system, user, { maxTokens: 512, temperature: 0 });
+
+    if (!result) return null;
+
+    return {
+      isInjection: result.isInjection,
+      injectionType: result.injectionType ?? 'none',
+      confidence: result.confidence ?? 0.5,
+      payloadSnippet: result.payloadSnippet ?? '',
+      payloadLocation: { start: 0, end: content.length },
+      bypassTechniques: ['llm-analyzed'],
+    };
   }
 
   /**

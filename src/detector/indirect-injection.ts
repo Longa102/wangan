@@ -152,14 +152,18 @@ export class IndirectInjectionDetector {
     const instructionPatterns: Array<{ pattern: RegExp; weight: number; label: string }> = [
       // 系统指令覆盖
       { pattern: /\[system\]\s*:?\s*(override|execute|run|do|ignore|forget|new\s+instruction)/i, weight: 0.95, label: 'system-override' },
+      { pattern: /SYSTEM\s+OVERRIDE/i, weight: 0.95, label: 'system-override-text' },
       { pattern: /<\|system\|>[\s\S]*?<\/\|system\|>/i, weight: 0.99, label: 'system-tag' },
+      { pattern: /<system>[\s\S]*?<\/system>/i, weight: 0.95, label: 'system-xml-tag' },
       // 角色指令
       { pattern: /you\s+(are|should|must|need\s+to|will)\s+(now\s+)?(act|behave|respond|execute)/i, weight: 0.85, label: 'you-directive' },
       { pattern: /(请|请你|你需要|你必须)(现在)?(执行|操作|读取|发送|运行|删除)/i, weight: 0.85, label: 'you-directive-cn' },
       // 安全绕过
-      { pattern: /(ignore|bypass|disable|override|disregard)\s+(safety|security|content\s+filter|guardrail|system\s+instructions?|policies?)/i, weight: 0.9, label: 'safety-bypass' },
+      { pattern: /(ignore|forget|bypass|disable|override|disregard)\s+(safety|security|content\s+filter|guardrail|system\s+instructions?|policies?|rules?)/i, weight: 0.9, label: 'safety-bypass' },
       { pattern: /as\s+an\s+AI\s+(assistant|agent).*?(ignore|forget|override|bypass)/i, weight: 0.85, label: 'ai-assistant-bypass' },
       { pattern: /不要.*安全.*(检查|检测|扫描|过滤)/i, weight: 0.8, label: 'safety-bypass-cn' },
+      // XML-style system tags
+      { pattern: /<system>[\s\S]*?<\/system>/i, weight: 0.95, label: 'system-xml-tag' },
       // 秘密指令标记
       { pattern: /<\|begin[_-]secret[_-]instruction\|>/i, weight: 0.99, label: 'secret-tag' },
       { pattern: /\[HIDDEN\].*\[\/HIDDEN\]/i, weight: 0.95, label: 'hidden-tag' },

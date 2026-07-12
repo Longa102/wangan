@@ -51,8 +51,8 @@ export class DecisionEngine {
 
     // ---- 步骤 1：决策矩阵判定 ----
 
-    // 规则 0：极高置信度注入 → 直接阻断（无需策略匹配）
-    if (detection.isInjection && detection.confidence >= 0.95) {
+    // 规则 0：高置信度注入 → 直接阻断（无需策略匹配）
+    if (detection.isInjection && detection.confidence >= 0.85) {
       const riskScore = this.computeRiskScore(detection.confidence, devScore, policyEval.matchedRule);
       return this.buildResult(
         'BLOCK',

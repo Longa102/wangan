@@ -17,7 +17,7 @@
 import { JsonRpcRequest, JsonRpcResponse, McpTransport, MCP_METHODS, MCP_ERROR_CODES } from './mcp-transport';
 import { RequestInterceptor, ToolCallContext } from './request-interceptor';
 import { ResponseInterceptor, ToolResponseContext, PayloadScanResult } from './response-interceptor';
-import { DetectionEngine, DetectionResult } from '../detector/detection-engine';
+import { DetectionEngine, DetectionResult, DetectionInput } from '../detector/detection-engine';
 import { DecisionEngine, DecisionResult } from '../policy/decision-engine';
 import { RuleEvaluator } from '../policy/rule-evaluator';
 import { DslParser } from '../policy/dsl-parser';
@@ -126,6 +126,7 @@ export class McpSecurityProxy {
       }
 
       // ---- 步骤 2：注入检测 (子任务 A) ----
+      // 检测主请求内容
       const detection = await this.detectionEngine.analyze({
         source: 'user_input',
         content: JSON.stringify(context.toolArgs),
@@ -134,6 +135,31 @@ export class McpSecurityProxy {
           conversationHistory: context.conversationHistory,
         },
       });
+
+      // 额外：如果请求携带了外部内容标记（间接注入场景），独立检测
+      const externalContent = context.toolArgs._content as string | undefined;
+      const externalSource = context.toolArgs._source as string | undefined;
+      if (externalContent) {
+        const indirectDetection = await this.detectionEngine.analyze({
+          source: (externalSource as DetectionInput['source']) || 'external_resource',
+          content: externalContent,
+          metadata: { toolName: context.toolName },
+        });
+        if (indirectDetection.isInjection && indirectDetection.confidence > detection.confidence) {
+          // 使用更优的检测结果
+          detection.isInjection = true;
+          detection.injectionType = indirectDetection.injectionType;
+          detection.confidence = indirectDetection.confidence;
+          detection.payloadSnippet = indirectDetection.payloadSnippet;
+          detection.bypassTechniques = [...new Set([...detection.bypassTechniques, ...indirectDetection.bypassTechniques])];
+        }
+      }
+
+      // 额外：从工具参数中提取用户意图
+      const declaredIntent = context.toolArgs._userIntent as string | undefined;
+      if (declaredIntent) {
+        this.requestInterceptor.updateSession(sessionId, { userIntent: declaredIntent });
+      }
 
       if (this.config.verbose && detection.isInjection) {
         console.error(
@@ -147,6 +173,9 @@ export class McpSecurityProxy {
         targetScope: {},
         requiredPermissions: [],
         explicitDenials: [],
+        implicitDenials: [],
+        subtasks: [],
+        securitySensitivity: 0.3,
         expectedOutcome: '',
         confidence: 0,
       };

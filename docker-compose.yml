@@ -1,0 +1,17 @@
+version: "3.9"
+
+services:
+  wangan:
+    build: .
+    container_name: wangan
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    ports:
+      - "80:3001"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3001/api/stats"]
+      interval: 15s
+      retries: 3
+    volumes:
+      - ./logs:/app/logs
