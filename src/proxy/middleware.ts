@@ -226,7 +226,17 @@ export class McpSecurityProxy {
           },
         }];
 
-        deviation = this.deviationScorer.score(intent, plan, toolCalls);
+        // 优先尝试 LLM 增强评分，失败回退规则评分
+        try {
+          const llmDeviation = await this.deviationScorer.scoreAsync(intent, plan, toolCalls);
+          if (llmDeviation) {
+            deviation = llmDeviation;
+          } else {
+            deviation = this.deviationScorer.score(intent, plan, toolCalls);
+          }
+        } catch {
+          deviation = this.deviationScorer.score(intent, plan, toolCalls);
+        }
       } catch {
         // 偏离度评分失败使用默认零值（不偏离）
       }

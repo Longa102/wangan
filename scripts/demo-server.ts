@@ -2,8 +2,23 @@
  * Demo API Server — 为前端演示提供数据
  *
  * 启动：npx ts-node --transpile-only scripts/demo-server.ts
- * 然后：cd demo && npm run dev
+ * 前端：cd demo && npm run dev
+ *
+ * LLM：设置 DEEPSEEK_API_KEY / ANTHROPIC_API_KEY 环境变量 或创建 .env 文件
  */
+
+// 加载 .env 文件（如果存在）
+import * as _fs_dotenv from 'fs';
+import * as _path_dotenv from 'path';
+const _envPath = _path_dotenv.resolve(__dirname, '../.env');
+if (_fs_dotenv.existsSync(_envPath)) {
+  const _lines = _fs_dotenv.readFileSync(_envPath, 'utf-8').split('\n');
+  for (const _line of _lines) {
+    const _m = _line.match(/^\s*([^#=]+?)\s*=\s*(.+?)\s*$/);
+    if (_m && !process.env[_m[1]]) process.env[_m[1]] = _m[2].replace(/^["']|["']$/g, '');
+  }
+  console.log('[Demo] .env loaded');
+}
 
 import * as http from 'http';
 import * as fs from 'fs';
