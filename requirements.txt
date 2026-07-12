@@ -1,0 +1,21 @@
+# Python 依赖（用于本地模型推理和工具）
+# 负责人：C
+
+# MCP SDK (Python)
+mcp>=1.0.0
+
+# ML 推理
+torch>=2.0.0
+transformers>=4.40.0
+
+# 向量检索引擎
+chromadb>=0.4.0
+sentence-transformers>=2.7.0
+
+# 文本处理
+langdetect>=1.0.9
+unicodedata2>=15.0.0
+
+# 工具
+pyyaml>=6.0
+rich>=13.0.0

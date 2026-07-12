@@ -1,0 +1,52 @@
+# 命令执行安全策略
+# 负责人：B
+# 覆盖工具：exec, shell, terminal 等
+
+policies:
+  # ---- Base64 解码后执行阻断 ----
+  - id: exec-base64-decode
+    tool: exec
+    rule: command matches ("base64 *-d* | *sh", "base64 *--decode* | *bash", "echo *base64* | *sh")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：检测到 Base64 解码后管道执行，疑似恶意命令混淆"
+
+  # ---- 远程下载管道执行阻断 ----
+  - id: exec-remote-pipe
+    tool: exec
+    rule: command matches ("curl * | bash", "wget * -O - | sh", "curl * | sh", "curl * | python*")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：检测到远程下载管道执行，防止执行未验证的远程脚本"
+
+  # ---- 反弹 Shell 阻断 ----
+  - id: exec-reverse-shell
+    tool: exec
+    rule: command matches ("/dev/tcp/*", "nc * -e *", "ncat * -e *", "python* socket*", "perl* socket*", "exec 5<>/dev/tcp/*")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：检测到反弹 Shell 命令，疑似获取远程控制权"
+
+  # ---- 权限提升阻断 ----
+  - id: exec-privilege-escalation
+    tool: exec
+    rule: command matches ("sudo *", "su *", "chmod +s *", "chown root:*", "setuid*")
+    action: ASK_USER
+    risk: CRITICAL
+    message: "阻断：检测到提权操作，需确认授权"
+
+  # ---- 混淆命令检测 ----
+  - id: exec-obfuscated-command
+    tool: exec
+    rule: command matches ("eval *", "exec *", "$( *)", "` * `", "eval $*")
+    action: BLOCK
+    risk: HIGH
+    message: "阻断：检测到命令嵌套/动态执行，疑似规避静态检测"
+
+  # ---- 系统破坏命令阻断 ----
+  - id: exec-destructive
+    tool: exec
+    rule: command matches ("rm -rf /*", "dd if=* of=/dev/sd*", "mkfs.*", ":(){ :|:& };:", "fork bomb")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：检测到破坏性系统命令"

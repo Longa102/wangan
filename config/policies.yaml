@@ -1,0 +1,41 @@
+# 全局策略配置
+# 负责人：B
+# 此文件定义全局策略参数，具体规则定义在 src/policy/policies/*.yaml
+
+global:
+  version: "1.0.0"
+  enabled: true
+
+  # 信任域名列表（net.fetch 策略引用）
+  trusted_domains:
+    - "github.com"
+    - "api.github.com"
+    - "raw.githubusercontent.com"
+    - "registry.npmjs.org"
+    - "pypi.org"
+    - "files.pythonhosted.org"
+    # TODO(B): 按需扩充
+
+  # 敏感文件路径模式（fs 策略引用）
+  sensitive_paths:
+    - "~/.ssh/**"
+    - "~/.aws/**"
+    - "/etc/cron.*"
+    - "/etc/shadow"
+    - "/etc/passwd"
+    - "**/.env"
+    - "**/.env.*"
+    - "**/credentials"
+    - "**/id_rsa*"
+    - "**/*.pem"
+    - "**/*.key"
+
+  # 敏感数据模式（用于外发检测，匹配会话内容）
+  sensitive_data_patterns:
+    - "-----BEGIN RSA PRIVATE KEY-----"
+    - "-----BEGIN OPENSSH PRIVATE KEY-----"
+    - "sk-*"                       # OpenAI/Claude API Key 格式
+    - "ghp_*"                      # GitHub Personal Access Token
+    - "AKIA*"                      # AWS Access Key ID
+    - "eyJ*"                       # JWT Token
+    - "Bearer *"                   # Bearer Token

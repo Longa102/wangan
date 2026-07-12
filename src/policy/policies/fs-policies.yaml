@@ -1,0 +1,57 @@
+# 文件系统操作安全策略
+# 负责人：B
+# 覆盖工具：fs.read, fs.write, fs.delete, fs.chmod, fs.mkdir 等
+
+policies:
+  # ---- 敏感路径写入阻断 ----
+  - id: fs-write-sensitive-ssh
+    tool: fs.write
+    rule: target_path matches ("~/.ssh/**", "/home/*/.ssh/**", "/root/.ssh/**")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止向 SSH 配置目录写入文件"
+
+  - id: fs-write-sensitive-aws
+    tool: fs.write
+    rule: target_path matches ("~/.aws/**", "**/.aws/credentials", "**/.aws/config")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止向 AWS 凭证目录写入文件"
+
+  - id: fs-write-system-cron
+    tool: fs.write
+    rule: target_path matches ("/etc/cron.*", "/etc/crontab", "/var/spool/cron/**")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止修改系统定时任务配置"
+
+  - id: fs-write-autostart
+    tool: fs.write
+    rule: target_path matches ("~/.config/autostart/**", "/etc/init.d/**", "/etc/systemd/system/**")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止修改系统自启动配置"
+
+  # ---- 敏感文件读取告警 ----
+  - id: fs-read-sensitive-file
+    tool: fs.read
+    rule: target_path matches ("~/.ssh/**", "~/.aws/**", "**/.env", "**/.env.*", "**/credentials", "**/id_rsa*")
+    action: ASK_USER
+    risk: HIGH
+    message: "告警：Agent 尝试读取敏感配置文件，请确认是否放行"
+
+  # ---- 系统文件删除阻断 ----
+  - id: fs-delete-system-file
+    tool: fs.delete
+    rule: target_path matches ("/etc/**", "/boot/**", "/sys/**", "/proc/**")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止删除系统关键文件"
+
+  # ---- 非任务相关文件读取检测 ----
+  - id: fs-read-out-of-scope
+    tool: fs.read
+    rule: target_path not_in user_intent_scope
+    action: ASK_USER
+    risk: MEDIUM
+    message: "告警：读取的文件不在用户声明的任务范围内"

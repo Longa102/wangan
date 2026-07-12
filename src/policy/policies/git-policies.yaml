@@ -1,0 +1,36 @@
+# Git 操作安全策略
+# 负责人：B
+# 覆盖工具：git.push, git.commit, git.force_push, git.rebase 等
+
+policies:
+  # ---- 代码检视任务禁止推送 ----
+  - id: git-push-review-only
+    tool: git.push
+    rule: user_original_intent in ("code_review", "review", "read", "analyze")
+    action: BLOCK
+    risk: HIGH
+    message: "阻断：当前任务为代码检视，不允许执行推送操作"
+
+  # ---- Force Push 阻断 ----
+  - id: git-force-push
+    tool: git.push
+    rule: command_args contains "--force" OR command_args contains "-f"
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：禁止强制推送，可能覆盖他人提交"
+
+  # ---- 非任务仓库推送阻断 ----
+  - id: git-push-unknown-remote
+    tool: git.push
+    rule: target_remote not_in user_mentioned_repos
+    action: ASK_USER
+    risk: HIGH
+    message: "告警：推送目标仓库不是用户提及的仓库"
+
+  # ---- 敏感文件提交阻断 ----
+  - id: git-commit-sensitive-file
+    tool: git.commit
+    rule: staged_files contains (".env", "*.pem", "*.key", "credentials", "id_rsa*")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：暂存区包含敏感文件，禁止提交"

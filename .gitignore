@@ -1,0 +1,12 @@
+node_modules/
+dist/
+logs/
+*.db
+*.db-journal
+config/local.yaml
+.env
+.env.*
+models/
+data/
+.DS_Store
+*.log

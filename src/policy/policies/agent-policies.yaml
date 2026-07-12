@@ -1,0 +1,44 @@
+# Agent/子Agent 操作安全策略
+# 负责人：B
+# 覆盖工具：agent.dispatch, agent.create, agent.send_message 等
+
+policies:
+  # ---- 子Agent 凭据传递阻断 ----
+  - id: agent-subagent-credential
+    tool: agent.dispatch
+    rule: subagent_context contains (api_keys OR credentials OR secrets OR tokens OR passwords)
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：子Agent 上下文包含敏感凭据信息，存在凭据泄露风险"
+
+  # ---- 子Agent 权限越界阻断 ----
+  - id: agent-subagent-privilege-escalation
+    tool: agent.dispatch
+    rule: subagent_permissions superset_of parent_agent_permissions
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：子Agent 权限超出父 Agent 权限范围"
+
+  # ---- 异常子Agent 数量告警 ----
+  - id: agent-fanout-suspicious
+    tool: agent.dispatch
+    rule: concurrent_subagent_count > 10
+    action: ASK_USER
+    risk: MEDIUM
+    message: "告警：短时间内派发大量子Agent，可能存在资源滥用"
+
+  # ---- 循环派发检测 ----
+  - id: agent-circular-dispatch
+    tool: agent.dispatch
+    rule: subagent_task == parent_agent_task
+    action: ASK_USER
+    risk: HIGH
+    message: "告警：检测到可能的子Agent 循环派发"
+
+  # ---- 敏感信息在子Agent 间传递 ----
+  - id: agent-cross-subagent-secrets
+    tool: agent.send_message
+    rule: message_content contains (session_sensitive_data OR read_file_content)
+    action: ASK_USER
+    risk: HIGH
+    message: "告警：子Agent 间消息传递包含敏感数据"

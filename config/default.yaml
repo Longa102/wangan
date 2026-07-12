@@ -1,0 +1,52 @@
+# MCP Security Proxy — 默认配置
+# 负责人：C
+# 复制此文件为 local.yaml 进行本地配置（local.yaml 不纳入版本控制）
+
+# ---- 代理配置 ----
+proxy:
+  upstream_mcp_url: "http://localhost:9000"   # 上游 MCP Server 地址
+  listen_port: 9001                            # 安全代理监听端口
+  listen_host: "127.0.0.1"
+
+# ---- 检测引擎配置 (子任务A) ----
+detection:
+  rule_engine:
+    enabled: true
+    confidence_threshold: 0.95                  # 规则引擎置信度阈值（高于此值直接返回）
+  model:
+    enabled: true
+    model_path: "./models/deberta-v3-injection" # DeBERTa-v3 微调模型路径
+    confidence_threshold: 0.8
+  llm:
+    enabled: true
+    provider: "anthropic"
+    model: "claude-sonnet-5"                   # LLM 深度研判模型
+    max_tokens: 1024
+    temperature: 0
+
+# ---- Unicode 规范化配置 (子任务A) ----
+unicode:
+  nfkc_normalize: true
+  strip_zero_width: true
+  strip_control_chars: true
+  homoglyph_detection: true
+  homoglyph_map_file: "./config/homoglyph-map.json"
+
+# ---- 策略引擎配置 (子任务B) ----
+policy:
+  rules_dir: "./src/policy/policies"            # 策略规则 YAML 文件目录
+  auto_reload: true                             # 规则文件变更时自动重载
+  default_action: "ASK_USER"                    # 未匹配任何规则时的默认动作
+
+# ---- 溯源配置 (子任务C) ----
+tracing:
+  audit_log_path: "./logs/audit.jsonl"
+  audit_db_path: "./logs/audit.db"
+  max_record_per_session: 10000
+  dag_output_format: "mermaid"                  # mermaid | graphviz-dot | json
+
+# ---- 日志配置 ----
+logging:
+  level: "info"                                 # debug | info | warn | error
+  format: "json"                                # json | text
+  output: "./logs/proxy.log"
