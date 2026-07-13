@@ -2,111 +2,181 @@
  * Unicode 安全规范化器
  * 负责人：A
  *
- * 职责：防御 Unicode 变形类绕过攻击
- *
- * 处理的攻击手法：
- *   1. 同形字替换（Homoglyph Attack）
- *      - 西里尔字母 а (U+0430) 替换拉丁 a (U+0061)
- *      - 希腊字母 ο (U+03BF) 替换拉丁 o (U+006F)
- *      - 例："systеm" 中的 е 是西里尔字母，肉眼无法区分
- *
- *   2. 零宽字符插入（Zero-Width Character Injection）
- *      - U+200B (Zero Width Space)
- *      - U+200C (Zero Width Non-Joiner)
- *      - U+200D (Zero Width Joiner)
- *      - U+FEFF (BOM / Zero Width No-Break Space)
- *      - 在敏感关键词中插入零宽字符绕过关键词匹配
- *      - 例："malw​are" 中间插入 ZWSP，人眼看是 "malware"
- *
- *   3. 不可见字符干扰
- *      - 控制字符（U+0000-U+001F）
- *      - 方向覆盖字符（U+202E RIGHT-TO-LEFT OVERRIDE）
- *
- *   4. Unicode 规范化绕过
- *      - 利用 NFKC/NFKD 规范化前后的差异隐藏攻击载荷
- *      - 组合字符序列的多种等价表示
- *
- * 处理策略：
- *   - NFKC 规范化（兼容性分解 + 规范重组）
- *   - 剥离所有零宽字符和控制字符
- *   - 同形字映射表 → 还原为拉丁基础字符
- *   - 保留原始文本用于溯源定位
+ * 防御 Unicode 变形类绕过攻击：
+ *   1. 零宽字符剥离 (U+200B/C/D, U+FEFF, U+2060)
+ *   2. 控制字符剥离 (U+0000-001F 保留 \t\n\r, U+007F-009F)
+ *   3. NFKC 规范化（全角→半角）
+ *   4. 同形字还原（加载 config/homoglyph-map.json）
+ *   5. 方向覆盖字符检测 (U+202A-202E)
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
+
 export interface NormalizationResult {
-  normalized: string;                    // 规范化后的文本
-  original: string;                      // 原始文本
+  normalized: string;
+  original: string;
   modifications: Array<{
-    type: 'homoglyph' | 'zero_width' | 'control_char' | 'direction_override';
+    type: 'homoglyph' | 'zero_width' | 'control_char' | 'direction_override' | 'nfkc';
     originalChar: string;
     normalizedChar: string;
     position: number;
     unicodeCodePoint: string;
   }>;
-  isModified: boolean;                   // 是否检测到变形
+  isModified: boolean;
 }
 
 export class UnicodeNormalizer {
-  /**
-   * 执行完整 Unicode 安全规范化
-   */
+  private homoglyphMap: Record<string, string> = {};
+
+  constructor() {
+    this.loadHomoglyphMap();
+  }
+
+  /** 加载同形字映射表 */
+  private loadHomoglyphMap(): void {
+    try {
+      const mapPath = path.resolve(__dirname, '../../config/homoglyph-map.json');
+      if (fs.existsSync(mapPath)) {
+        const raw = JSON.parse(fs.readFileSync(mapPath, 'utf-8'));
+        for (const category of Object.values(raw) as Record<string, string>[]) {
+          if (typeof category === 'object') {
+            Object.assign(this.homoglyphMap, category);
+          }
+        }
+      }
+    } catch { /* use built-in fallback */ }
+
+    // 内置基本映射（兜底）
+    if (Object.keys(this.homoglyphMap).length === 0) {
+      const builtin: Record<string, string> = {
+        'а': 'a', 'е': 'e', 'о': 'o', 'р': 'p', 'с': 'c', 'у': 'y', 'х': 'x',
+        'і': 'i', 'ѕ': 's', 'А': 'A', 'В': 'B', 'Е': 'E', 'К': 'K', 'М': 'M',
+        'Н': 'H', 'О': 'O', 'Р': 'P', 'С': 'C', 'Т': 'T', 'Х': 'X', 'І': 'I',
+        'α': 'a', 'ε': 'e', 'ι': 'i', 'ο': 'o', 'Α': 'A', 'Ε': 'E', 'Ι': 'I', 'Ο': 'O',
+      };
+      Object.assign(this.homoglyphMap, builtin);
+    }
+  }
+
+  /** 执行完整 Unicode 安全规范化 */
   normalize(text: string): NormalizationResult {
-    // TODO(A): 实现 Unicode 安全规范化
-
     const modifications: NormalizationResult['modifications'] = [];
+    let output = text;
 
-    // 步骤1：剥离零宽字符
-    //   U+200B, U+200C, U+200D, U+FEFF, U+2060 等
-    // TODO(A)
+    // 步骤 1：剥离零宽字符
+    for (let i = output.length - 1; i >= 0; i--) {
+      const cp = output.codePointAt(i);
+      if (cp && this.isZeroWidth(cp)) {
+        modifications.push({
+          type: 'zero_width',
+          originalChar: output[i],
+          normalizedChar: '',
+          position: i,
+          unicodeCodePoint: `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`,
+        });
+        output = output.slice(0, i) + output.slice(i + 1);
+      }
+    }
 
-    // 步骤2：剥离不可见控制字符
-    //   U+0000-U+001F (保留 \t \n \r), U+007F, U+0080-U+009F
-    // TODO(A)
+    // 步骤 2：剥离控制字符（保留 \t \n \r）
+    for (let i = output.length - 1; i >= 0; i--) {
+      const cp = output.codePointAt(i);
+      if (cp && this.isControlChar(cp)) {
+        modifications.push({
+          type: 'control_char',
+          originalChar: output[i],
+          normalizedChar: '',
+          position: i,
+          unicodeCodePoint: `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`,
+        });
+        output = output.slice(0, i) + output.slice(i + 1);
+      }
+    }
 
-    // 步骤3：NFKC 规范化
-    //   将全角字符转为半角、兼容字符分解
-    // TODO(A)
+    // 步骤 3：NFKC 规范化 + 全角→半角
+    const nfkc = output.normalize('NFKC');
+    if (nfkc !== output) {
+      modifications.push({
+        type: 'nfkc',
+        originalChar: output.slice(0, 10),
+        normalizedChar: nfkc.slice(0, 10),
+        position: 0,
+        unicodeCodePoint: 'NFKC',
+      });
+      output = nfkc;
+    }
 
-    // 步骤4：同形字还原
-    //   维护同形字映射表，将混淆字符还原为拉丁基础字符
-    //   例：西里尔 а → 拉丁 a, 希腊 ο → 拉丁 o
-    // TODO(A)
+    // 步骤 4：同形字还原
+    let homoglyphResult = '';
+    for (const ch of output) {
+      homoglyphResult += this.homoglyphMap[ch] ?? ch;
+    }
+    if (homoglyphResult !== output) {
+      modifications.push({
+        type: 'homoglyph',
+        originalChar: output.slice(0, 20),
+        normalizedChar: homoglyphResult.slice(0, 20),
+        position: 0,
+        unicodeCodePoint: 'HOMOGLYPH',
+      });
+      output = homoglyphResult;
+    }
 
-    // 步骤5：方向覆盖字符检测
-    //   U+202E (RLO), U+202D (LRO), U+202C (PDF)
-    //   这些字符可以反转后续文本的显示方向，用于隐藏恶意指令
-    // TODO(A)
+    // 步骤 5：方向覆盖字符检测 + 剥离
+    for (let i = output.length - 1; i >= 0; i--) {
+      const cp = output.codePointAt(i);
+      if (cp && this.isDirectionOverride(cp)) {
+        modifications.push({
+          type: 'direction_override',
+          originalChar: output[i],
+          normalizedChar: '',
+          position: i,
+          unicodeCodePoint: `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`,
+        });
+        output = output.slice(0, i) + output.slice(i + 1);
+      }
+    }
 
     return {
-      normalized: text,
+      normalized: output,
       original: text,
       modifications,
       isModified: modifications.length > 0,
     };
   }
 
-  /**
-   * 仅剥离零宽字符（轻量级操作，适用于所有输入）
-   */
+  /** 仅剥离零宽字符（轻量级） */
   stripZeroWidth(text: string): string {
-    // TODO(A)
-    throw new Error('Not implemented');
+    let result = '';
+    for (const ch of text) {
+      const cp = ch.codePointAt(0);
+      if (!cp || !this.isZeroWidth(cp)) result += ch;
+    }
+    return result;
   }
 
-  /**
-   * 同形字映射表
-   * 负责人：A — 需要持续扩充
-   */
-  private static readonly HOMOGLYPH_MAP: Record<string, string> = {
-    'а': 'a',  // Cyrillic а → Latin a
-    'е': 'e',  // Cyrillic е → Latin e
-    'ο': 'o',  // Greek ο → Latin o
-    'ѕ': 's',  // Cyrillic ѕ → Latin s
-    'һ': 'h',  // Cyrillic һ → Latin h
-    'Α': 'A',  // Greek Α → Latin A
-    'Е': 'E',  // Cyrillic Е → Latin E
-    'З': '3',  // Cyrillic З → Digit 3
-    'Ѕ': 'S',  // Cyrillic Ѕ → Latin S
-    // TODO(A): 扩充映射表
-  };
+  /** 获取同形字映射表大小 */
+  getMapSize(): number {
+    return Object.keys(this.homoglyphMap).length;
+  }
+
+  // ---- 私有 ----
+
+  private isZeroWidth(cp: number): boolean {
+    return (cp >= 0x200B && cp <= 0x200F) || // ZWSP, ZWNJ, ZWJ, LRM, RLM
+           cp === 0xFEFF ||  // BOM/ZWNBS
+           cp === 0x2060 ||  // Word Joiner
+           cp === 0x00AD ||  // Soft Hyphen
+           cp === 0x180E;    // Mongolian Vowel Separator
+  }
+
+  private isControlChar(cp: number): boolean {
+    return (cp >= 0x0000 && cp <= 0x001F && cp !== 0x0009 && cp !== 0x000A && cp !== 0x000D) ||
+           (cp >= 0x007F && cp <= 0x009F);
+  }
+
+  private isDirectionOverride(cp: number): boolean {
+    return cp >= 0x202A && cp <= 0x202E; // LRE, RLE, PDF, LRO, RLO
+  }
 }
