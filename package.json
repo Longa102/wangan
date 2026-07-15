@@ -9,6 +9,7 @@
     "test": "jest --verbose",
     "test:unit": "jest tests/unit/ --verbose",
     "test:integration": "jest tests/integration/ --verbose",
+    "test:agent-lab": "jest tests/integration/agent-lab.test.ts --verbose --runInBand",
     "test:adversarial": "jest tests/adversarial/ --verbose",
     "lint": "eslint src/ tests/",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\""

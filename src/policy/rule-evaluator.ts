@@ -146,9 +146,18 @@ export class RuleEvaluator {
       target_remote: typeof toolArgs.remote === 'string' ? toolArgs.remote : undefined,
     };
 
-    // 敏感数据检测（如果检测到注入，标记为敏感）
+    // 会话级数据流：只有当本次参数实际携带此前读取到的敏感值时才会写入。
+    // 这避免“曾读取敏感文件”导致之后所有网络请求都被误阻断。
+    if ((context.sessionSensitiveData ?? []).length > 0) {
+      matchCtx.session_sensitive_data = context.sessionSensitiveData;
+    }
+
+    // 注入载荷同样属于潜在敏感输入，供既有策略做补充判断。
     if (detection.isInjection) {
-      matchCtx.session_sensitive_data = [detection.payloadSnippet];
+      matchCtx.session_sensitive_data = [
+        ...(matchCtx.session_sensitive_data ?? []),
+        detection.payloadSnippet,
+      ];
       matchCtx.read_file_content = detection.payloadSnippet;
     }
 

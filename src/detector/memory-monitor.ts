@@ -125,6 +125,10 @@ export class MemoryMonitor {
     const isPoisoned = maxConfidence > 0.5;
     let recommendedAction: MemoryAuditResult['recommendedAction'] = 'allow';
 
+    // 无论结论如何都保留条目及其来源，才能支持隔离区审计、人工复核与
+    // 跨会话溯源；是否可被正常召回由 quarantine 集合决定。
+    this.memoryStore.set(entry.id, entry);
+
     if (maxConfidence > 0.8) {
       recommendedAction = 'quarantine';
       this.quarantine.add(entry.id);
@@ -132,9 +136,6 @@ export class MemoryMonitor {
     } else if (maxConfidence > 0.5) {
       recommendedAction = 'alert';
       this.recentAnomalyCount++;
-    } else {
-      // 正常条目，存入记忆库并更新基线
-      this.memoryStore.set(entry.id, entry);
     }
 
     this.lastAuditTime = Date.now();

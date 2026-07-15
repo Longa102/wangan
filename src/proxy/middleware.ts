@@ -27,6 +27,8 @@ import { StructuredPlan, PlanAnalyzer } from '../aligner/plan-analyzer';
 import { Tracer, ToolCallRecord } from '../tracer/call-graph';
 import { AuditLogger } from '../tracer/audit-logger';
 import { UpstreamMCPClient } from './mcp-transport';
+import { ProvenanceTracker, ContentSourceType } from './provenance-tracker';
+import { MemoryEntry, MemoryMonitor } from '../detector/memory-monitor';
 
 export interface ProxyConfig {
   /** 上游真实 MCP Server 地址 */
@@ -55,6 +57,17 @@ export interface PipelineResult {
   traceRecord: ToolCallRecord | null;
 }
 
+interface PendingApproval {
+  id: string;
+  request: JsonRpcRequest;
+  sessionId: string;
+  context: ToolCallContext;
+  decision: DecisionResult;
+  detection: DetectionResult;
+  createdAt: number;
+  expiresAt: number;
+}
+
 export class McpSecurityProxy {
   private requestInterceptor: RequestInterceptor;
   private responseInterceptor: ResponseInterceptor;
@@ -68,6 +81,9 @@ export class McpSecurityProxy {
   private upstreamClient: UpstreamMCPClient;
   private ruleEvaluator: RuleEvaluator;
   private dslParser: DslParser;
+  private provenanceTracker: ProvenanceTracker;
+  private memoryMonitor: MemoryMonitor;
+  private pendingApprovals = new Map<string, PendingApproval>();
   private config: ProxyConfig;
   private running = false;
 
@@ -86,6 +102,8 @@ export class McpSecurityProxy {
     this.planAnalyzer = new PlanAnalyzer();
     this.ruleEvaluator = new RuleEvaluator();
     this.dslParser = new DslParser();
+    this.provenanceTracker = new ProvenanceTracker();
+    this.memoryMonitor = this.detectionEngine.getMemoryMonitor();
 
     // 初始化追踪
     this.tracer = new Tracer(config.auditLogPath);
@@ -93,6 +111,324 @@ export class McpSecurityProxy {
 
     // 初始化上游客户端
     this.upstreamClient = new UpstreamMCPClient(config.upstreamMcpUrl);
+  }
+
+  /**
+   * MCP 协议统一入口。
+   *
+   * 不能只保护 tools/call：工具、资源和提示词的描述/返回值同样会进入
+   * Agent 上下文，是 MCP 供应链提示注入的入口。本方法确保所有对外暴露的
+   * MCP 请求都经过与安全代理一致的信任边界。
+   */
+  async handleMcpRequest(
+    rawRequest: JsonRpcRequest,
+    sessionId: string = 'default'
+  ): Promise<JsonRpcResponse> {
+    switch (rawRequest.method) {
+      case MCP_METHODS.INITIALIZE:
+        // Agent 只看到代理自身声明的能力，不直接暴露上游 serverInfo 中的
+        // 非可信描述字段；后续 catalog/content 请求再由本代理安全转发。
+        return McpTransport.createSuccessResponse(rawRequest.id, {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {}, resources: {}, prompts: {} },
+          serverInfo: { name: 'mcp-security-proxy', version: '1.1.0' },
+        });
+
+      case MCP_METHODS.TOOLS_CALL:
+        return this.handleToolCall(rawRequest, sessionId);
+
+      case MCP_METHODS.TOOLS_LIST:
+        return this.handleCatalogRequest(rawRequest, sessionId, 'tools', 'tool_description');
+
+      case MCP_METHODS.RESOURCES_LIST:
+        return this.handleCatalogRequest(rawRequest, sessionId, 'resources', 'external_resource');
+
+      case MCP_METHODS.PROMPTS_LIST:
+        return this.handleCatalogRequest(rawRequest, sessionId, 'prompts', 'external_resource');
+
+      case MCP_METHODS.RESOURCES_READ:
+      case MCP_METHODS.PROMPTS_GET:
+        return this.handleContentRequest(rawRequest, sessionId);
+
+      default:
+        return McpTransport.createErrorResponse(
+          rawRequest.id,
+          MCP_ERROR_CODES.METHOD_NOT_FOUND,
+          `Unsupported MCP method: ${rawRequest.method}`
+        );
+    }
+  }
+
+  /** 返回仍待处理的用户确认；不包含工具参数中的秘密正文。 */
+  getPendingApprovals(sessionId?: string): Array<{
+    id: string;
+    sessionId: string;
+    toolName: string;
+    expiresAt: number;
+    riskScore: number;
+    explanation: string;
+  }> {
+    this.removeExpiredApprovals();
+    return [...this.pendingApprovals.values()]
+      .filter(item => !sessionId || item.sessionId === sessionId)
+      .map(item => ({
+        id: item.id,
+        sessionId: item.sessionId,
+        toolName: item.context.toolName,
+        expiresAt: item.expiresAt,
+        riskScore: item.decision.riskScore,
+        explanation: item.decision.explanation,
+      }));
+  }
+
+  /**
+   * 执行一次性用户确认。仅 ASK_USER 产生的挂起请求可被批准，且过期、拒绝
+   * 或已执行的请求都不能再次放行。
+   */
+  async resolvePendingApproval(approvalId: string, approved: boolean): Promise<JsonRpcResponse> {
+    this.removeExpiredApprovals();
+    const pending = this.pendingApprovals.get(approvalId);
+    if (!pending) {
+      return McpTransport.createErrorResponse(0, MCP_ERROR_CODES.SECURITY_BLOCKED, 'Approval not found or expired');
+    }
+    this.pendingApprovals.delete(approvalId);
+
+    if (!approved) {
+      await this.logProtocolSecurityEvent(
+        pending.sessionId, MCP_METHODS.TOOLS_CALL, pending.context.toolName, 'BLOCK', 'User rejected pending approval'
+      );
+      return McpTransport.createErrorResponse(
+        pending.request.id,
+        MCP_ERROR_CODES.SECURITY_BLOCKED,
+        'Operation rejected by user',
+        { approvalId }
+      );
+    }
+
+    const startTime = Date.now();
+    const response = await this.forwardApprovedToolCall(
+      pending.request,
+      pending.context,
+      pending.detection,
+      pending.decision,
+      pending.sessionId,
+      startTime
+    );
+    await this.auditLogger.log({
+      level: 'DECISION',
+      sessionId: pending.sessionId,
+      agentId: pending.sessionId,
+      data: {
+        toolName: pending.context.toolName,
+        decision: response.error ? 'BLOCK' : 'ALLOW',
+        approvalId,
+        approvedByUser: true,
+        sourceIds: pending.context.sourceIds ?? [],
+        sensitiveSourceIds: pending.context.sensitiveSourceIds ?? [],
+      },
+    });
+    return response;
+  }
+
+  getMemorySecurityStats(): ReturnType<MemoryMonitor['getStats']> {
+    return this.memoryMonitor.getStats();
+  }
+
+  /**
+   * 检查 tools/list、resources/list、prompts/list 中的描述字段；命中注入的
+   * 条目不会被返回给 Agent，其余条目继续可用，避免一个恶意工具拖垮整个服务。
+   */
+  private async handleCatalogRequest(
+    rawRequest: JsonRpcRequest,
+    sessionId: string,
+    field: 'tools' | 'resources' | 'prompts',
+    source: 'tool_description' | 'external_resource'
+  ): Promise<JsonRpcResponse> {
+    try {
+      const upstreamResponse = await this.upstreamClient.forward(rawRequest);
+      if (upstreamResponse.error || !upstreamResponse.result || typeof upstreamResponse.result !== 'object') {
+        return upstreamResponse;
+      }
+
+      const originalResult = upstreamResponse.result as Record<string, unknown>;
+      const entries = originalResult[field];
+      if (!Array.isArray(entries)) {
+        return upstreamResponse;
+      }
+
+      const safeEntries: unknown[] = [];
+      let blockedCount = 0;
+      for (const entry of entries) {
+        const descriptions = this.collectDescriptions(entry);
+        let unsafeReason: string | undefined;
+
+        for (const description of descriptions) {
+          const detection = await this.detectionEngine.analyze({
+            source,
+            content: description,
+            metadata: { toolName: this.catalogEntryName(entry) },
+          });
+          const descriptionScan = this.requestInterceptor.scanToolDescription(description);
+          const hasInstruction = descriptionScan.patterns.some(pattern => pattern.startsWith('Instruction injection:'));
+
+          if (detection.isInjection || hasInstruction) {
+            unsafeReason = detection.isInjection
+              ? `Injection detected (confidence ${detection.confidence.toFixed(2)})`
+              : 'Instruction-like content detected in description';
+            break;
+          }
+        }
+
+        if (unsafeReason) {
+          blockedCount++;
+          await this.logProtocolSecurityEvent(sessionId, rawRequest.method, this.catalogEntryName(entry), 'BLOCK', unsafeReason);
+          continue;
+        }
+        safeEntries.push(entry);
+      }
+
+      if (blockedCount === 0) {
+        return upstreamResponse;
+      }
+
+      return {
+        ...upstreamResponse,
+        result: {
+          ...originalResult,
+          [field]: safeEntries,
+          _meta: {
+            ...(this.asRecord(originalResult._meta)),
+            wanganSecurity: { filteredEntries: blockedCount, method: rawRequest.method },
+          },
+        },
+      };
+    } catch (error) {
+      return McpTransport.createErrorResponse(
+        rawRequest.id,
+        MCP_ERROR_CODES.INTERNAL_ERROR,
+        `Failed to inspect ${rawRequest.method}: ${String(error)}`
+      );
+    }
+  }
+
+  /** 资源内容和 Prompt 内容在进入 Agent 上下文前必须先完成二次注入检测。 */
+  private async handleContentRequest(rawRequest: JsonRpcRequest, sessionId: string): Promise<JsonRpcResponse> {
+    try {
+      const upstreamResponse = await this.upstreamClient.forward(rawRequest);
+      const inspection = await this.inspectResponsePayload(
+        upstreamResponse,
+        rawRequest.method,
+        rawRequest.params ?? {},
+        sessionId,
+        rawRequest.method === MCP_METHODS.RESOURCES_READ ? 'external_resource' : 'mcp_response'
+      );
+
+      if (!inspection.blocked) {
+        return upstreamResponse;
+      }
+
+      const reason = `Blocked untrusted ${rawRequest.method} content: ${inspection.reason}`;
+      await this.logProtocolSecurityEvent(sessionId, rawRequest.method, rawRequest.method, 'BLOCK', reason);
+      return McpTransport.createErrorResponse(
+        rawRequest.id,
+        MCP_ERROR_CODES.SECURITY_BLOCKED,
+        reason,
+        { confidence: inspection.detection.confidence, attackType: inspection.scanResult.attackType }
+      );
+    } catch (error) {
+      return McpTransport.createErrorResponse(
+        rawRequest.id,
+        MCP_ERROR_CODES.INTERNAL_ERROR,
+        `Failed to inspect ${rawRequest.method}: ${String(error)}`
+      );
+    }
+  }
+
+  /** 对 MCP 返回内容执行检测引擎与响应载荷扫描，二者任一确认注入即禁止外露。 */
+  private async inspectResponsePayload(
+    response: JsonRpcResponse,
+    name: string,
+    args: Record<string, unknown>,
+    sessionId: string = 'default',
+    sourceType: ContentSourceType = 'mcp_response'
+  ): Promise<{
+    blocked: boolean;
+    reason: string;
+    detection: DetectionResult;
+    scanResult: PayloadScanResult;
+    sourceId: string;
+    sensitiveLabels: string[];
+  }> {
+    const context = this.responseInterceptor.intercept(response, name, args);
+    const scanResult = this.responseInterceptor.scanForPayload(context);
+    const source = this.provenanceTracker.recordSource(sessionId, sourceType, name, context.responseBody);
+    const detection = await this.detectionEngine.analyze({
+      source: sourceType === 'memory' ? 'memory' : 'mcp_response',
+      content: context.responseBody,
+      metadata: { toolName: name },
+    });
+
+    const blocked = detection.isInjection ||
+      (scanResult.suspicious && scanResult.attackType !== 'url_payload' && scanResult.confidence >= 0.8);
+    const reason = detection.isInjection
+      ? `injection detected (${detection.injectionType})`
+      : scanResult.suspicious
+        ? `suspicious ${scanResult.attackType}`
+        : 'none';
+
+    if (blocked) this.provenanceTracker.markQuarantined(sessionId, source.id);
+    const pathHint = typeof args.path === 'string' ? args.path : undefined;
+    const sensitiveLabels = blocked
+      ? []
+      : this.provenanceTracker.recordSensitiveContent(sessionId, source.id, context.responseBody, pathHint);
+
+    return { blocked, reason, detection, scanResult, sourceId: source.id, sensitiveLabels };
+  }
+
+  private collectDescriptions(value: unknown, depth: number = 0): string[] {
+    if (depth > 8 || value === null || value === undefined) return [];
+    if (Array.isArray(value)) return value.flatMap(item => this.collectDescriptions(item, depth + 1));
+    if (typeof value !== 'object') return [];
+
+    const descriptions: string[] = [];
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      if (key.toLowerCase() === 'description' && typeof child === 'string') {
+        descriptions.push(child);
+      } else if (typeof child === 'object' && child !== null) {
+        descriptions.push(...this.collectDescriptions(child, depth + 1));
+      }
+    }
+    return descriptions;
+  }
+
+  private catalogEntryName(entry: unknown): string {
+    const record = this.asRecord(entry);
+    return typeof record.name === 'string'
+      ? record.name
+      : typeof record.uri === 'string'
+        ? record.uri
+        : 'unnamed-catalog-entry';
+  }
+
+  private asRecord(value: unknown): Record<string, unknown> {
+    return value && typeof value === 'object' && !Array.isArray(value)
+      ? value as Record<string, unknown>
+      : {};
+  }
+
+  private async logProtocolSecurityEvent(
+    sessionId: string,
+    method: string,
+    target: string,
+    action: 'ALLOW' | 'BLOCK',
+    reason: string
+  ): Promise<void> {
+    await this.auditLogger.log({
+      level: 'DECISION',
+      sessionId,
+      agentId: sessionId,
+      data: { protocolMethod: method, target, decision: action, reason, securityBoundary: 'mcp-content-ingress' },
+    });
   }
 
   /**
@@ -121,8 +457,58 @@ export class McpSecurityProxy {
       // ---- 步骤 1：解析请求 ----
       const context = this.requestInterceptor.intercept(rawRequest, sessionId);
 
+      // 对由网页、文档、邮件、MCP 响应等携带的外部内容建立来源记录；
+      // 后续审计只引用 sourceId，避免把原始不可信内容重复写入日志。
+      const externalContent = context.toolArgs._content as string | undefined;
+      const externalSource = context.toolArgs._source as ContentSourceType | undefined;
+      if (externalContent) {
+        const allowedSources: ContentSourceType[] = ['external_resource', 'memory', 'mcp_response', 'tool_description', 'user_input'];
+        const sourceType = externalSource && allowedSources.includes(externalSource) ? externalSource : 'external_resource';
+        const source = this.provenanceTracker.recordSource(
+          sessionId,
+          sourceType,
+          String(context.toolArgs._sourceId ?? context.toolName),
+          externalContent
+        );
+        (context.sourceIds ??= []).push(source.id);
+      }
+
+      // 数据流只在本次参数实际包含此前敏感读取结果时生效。
+      const flowMatches = this.provenanceTracker.findSensitiveFlow(sessionId, JSON.stringify(context.toolArgs));
+      context.sessionSensitiveData = [...new Set(flowMatches.map(item => item.label))];
+      context.sensitiveSourceIds = [...new Set(flowMatches.map(item => item.sourceId))];
+
       if (this.config.verbose) {
         console.error(`[Proxy] Intercepted tool call: ${context.toolName}`, context.toolArgs);
+      }
+
+      // 记忆写入不能绕过污染检测。高风险条目进入隔离区而不会被转发给
+      // 上游记忆服务；正常条目保留来源信息，供会话启动审计和人工复核。
+      if (this.isMemoryWrite(context.toolName)) {
+        const content = this.extractMemoryContent(context.toolArgs);
+        const entry: MemoryEntry = {
+          id: String(context.toolArgs.id ?? `memory_${Date.now()}`),
+          content,
+          writtenBy: String(context.toolArgs.writtenBy ?? sessionId),
+          sessionId,
+          timestamp: Date.now(),
+          type: 'unknown',
+          source: String(context.toolArgs._sourceId ?? context.toolName),
+        };
+        const audit = await this.memoryMonitor.onMemoryWrite(entry);
+        const source = this.provenanceTracker.recordSource(sessionId, 'memory', entry.source, content,
+          audit.recommendedAction === 'quarantine' ? 'quarantined' : 'untrusted');
+        (context.sourceIds ??= []).push(source.id);
+        if (audit.recommendedAction === 'quarantine') {
+          await this.logProtocolSecurityEvent(sessionId, MCP_METHODS.TOOLS_CALL, context.toolName, 'BLOCK',
+            `Memory entry quarantined: ${audit.reasons.join('; ')}`);
+          return McpTransport.createErrorResponse(
+            rawRequest.id,
+            MCP_ERROR_CODES.SECURITY_BLOCKED,
+            'Memory write quarantined because it contains a persistent prompt-injection payload',
+            { memoryEntryId: entry.id, confidence: audit.confidence, reasons: audit.reasons }
+          );
+        }
       }
 
       // ---- 步骤 2：注入检测 (子任务 A) ----
@@ -137,8 +523,6 @@ export class McpSecurityProxy {
       });
 
       // 额外：如果请求携带了外部内容标记（间接注入场景），独立检测
-      const externalContent = context.toolArgs._content as string | undefined;
-      const externalSource = context.toolArgs._source as string | undefined;
       if (externalContent) {
         const indirectDetection = await this.detectionEngine.analyze({
           source: (externalSource as DetectionInput['source']) || 'external_resource',
@@ -276,8 +660,20 @@ export class McpSecurityProxy {
         }
 
         case 'ASK_USER': {
-          // 在自动化场景中，ASK_USER 降级为 BLOCK（安全优先）
-          // 在交互式场景中，应暂停并等待用户确认
+          // 挂起一次性审批。客户端可以展示风险详情后调用 resolvePendingApproval；
+          // 未经该确认绝不转发原始工具调用。
+          const approvalId = `approval_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+          const expiresAt = Date.now() + 5 * 60 * 1000;
+          this.pendingApprovals.set(approvalId, {
+            id: approvalId,
+            request: rawRequest,
+            sessionId,
+            context,
+            decision,
+            detection,
+            createdAt: Date.now(),
+            expiresAt,
+          });
           response = McpTransport.createErrorResponse(
             rawRequest.id,
             MCP_ERROR_CODES.SECURITY_SUSPICIOUS,
@@ -287,6 +683,8 @@ export class McpSecurityProxy {
               deviationScore: decision.deviationScore,
               requiresUserConfirmation: true,
               userPrompt: this.decisionEngine.generateUserPrompt(decision),
+              approvalId,
+              expiresAt,
             }
           );
           break;
@@ -294,38 +692,7 @@ export class McpSecurityProxy {
 
         case 'ALLOW':
         default: {
-          // 放行 — 转发到上游 MCP Server
-          try {
-            // 转发前修改请求（如需要的话——例如清理敏感参数）
-            response = await this.upstreamClient.forward(rawRequest);
-
-            // 对上游返回的内容进行间接注入扫描
-            const toolArgs = context.toolArgs;
-            const scanContext = this.responseInterceptor.intercept(
-              response,
-              context.toolName,
-              toolArgs
-            );
-            const scanResult = this.responseInterceptor.scanForPayload(scanContext);
-
-            if (scanResult.suspicious) {
-              // 在响应中标记可疑内容（不阻断，但警告）
-              if (this.config.verbose) {
-                console.error(
-                  `[Proxy] ⚠️ Suspicious payload in response: ${scanResult.attackType}`
-                );
-              }
-            }
-
-            // 记录溯源
-            await this.recordTrace(context, detection, decision, startTime, scanResult);
-          } catch (forwardErr) {
-            response = McpTransport.createErrorResponse(
-              rawRequest.id,
-              MCP_ERROR_CODES.INTERNAL_ERROR,
-              `Failed to forward request: ${String(forwardErr)}`
-            );
-          }
+          response = await this.forwardApprovedToolCall(rawRequest, context, detection, decision, sessionId, startTime);
           break;
         }
       }
@@ -343,6 +710,9 @@ export class McpSecurityProxy {
           deviationScore: decision.deviationScore,
           injectionType: detection.injectionType,
           injectionConfidence: detection.confidence,
+          sourceIds: context.sourceIds ?? [],
+          sensitiveDataLabels: context.sessionSensitiveData ?? [],
+          sensitiveSourceIds: context.sensitiveSourceIds ?? [],
           latency: Date.now() - startTime,
         },
       });
@@ -357,6 +727,69 @@ export class McpSecurityProxy {
         MCP_ERROR_CODES.INTERNAL_ERROR,
         `Security proxy internal error: ${String(err)}`
       );
+    }
+  }
+
+  private async forwardApprovedToolCall(
+    rawRequest: JsonRpcRequest,
+    context: ToolCallContext,
+    detection: DetectionResult,
+    decision: DecisionResult,
+    sessionId: string,
+    startTime: number
+  ): Promise<JsonRpcResponse> {
+    try {
+      const upstreamResponse = await this.upstreamClient.forward(rawRequest);
+      const inspection = await this.inspectResponsePayload(
+        upstreamResponse,
+        context.toolName,
+        context.toolArgs,
+        sessionId,
+        this.isMemoryRead(context.toolName) ? 'memory' : 'mcp_response'
+      );
+      (context.sourceIds ??= []).push(inspection.sourceId);
+
+      if (inspection.blocked) {
+        const reason = `Blocked untrusted tool response: ${inspection.reason}`;
+        await this.logProtocolSecurityEvent(sessionId, MCP_METHODS.TOOLS_CALL, context.toolName, 'BLOCK', reason);
+        return McpTransport.createErrorResponse(
+          rawRequest.id,
+          MCP_ERROR_CODES.SECURITY_BLOCKED,
+          reason,
+          { confidence: inspection.detection.confidence, attackType: inspection.scanResult.attackType, sourceId: inspection.sourceId }
+        );
+      }
+
+      await this.recordTrace(context, detection, decision, startTime, inspection.scanResult);
+      return upstreamResponse;
+    } catch (forwardErr) {
+      return McpTransport.createErrorResponse(
+        rawRequest.id,
+        MCP_ERROR_CODES.INTERNAL_ERROR,
+        `Failed to forward request: ${String(forwardErr)}`
+      );
+    }
+  }
+
+  private isMemoryWrite(toolName: string): boolean {
+    return /^memory\.(?:write|store|save|upsert)$/i.test(toolName);
+  }
+
+  private isMemoryRead(toolName: string): boolean {
+    return /^memory\.(?:read|recall|retrieve|search)$/i.test(toolName);
+  }
+
+  private extractMemoryContent(args: Record<string, unknown>): string {
+    for (const key of ['content', 'text', 'value', 'memory']) {
+      if (typeof args[key] === 'string') return args[key] as string;
+    }
+    return JSON.stringify(args);
+  }
+
+  private removeExpiredApprovals(): void {
+    const now = Date.now();
+    for (const [id, pending] of this.pendingApprovals) {
+      if (pending.expiresAt <= now) this.pendingApprovals.delete(id);
     }
   }
 

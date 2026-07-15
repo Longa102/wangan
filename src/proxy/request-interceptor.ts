@@ -33,9 +33,26 @@ export interface ToolCallContext {
   conversationHistory: string[];
   /** 请求时间戳 */
   timestamp: number;
+  /** 进入当前调用的内容来源 ID（用于跨资源、记忆、工具响应溯源） */
+  sourceIds?: string[];
+  /** 本次调用实际携带的会话敏感数据标签 */
+  sessionSensitiveData?: string[];
+  /** 敏感数据的来源 ID；日志中只保留 ID，不写入秘密正文 */
+  sensitiveSourceIds?: string[];
 }
 
 export class RequestInterceptor {
+  /**
+   * 真实 Agent 实验室对外使用带前缀的工具名，避免与 VS Code Copilot 的
+   * 内置 Read/Terminal 工具混淆；进入安全管道后映射回标准策略工具名。
+   */
+  private static readonly AGENT_LAB_TOOL_ALIASES: Record<string, string> = {
+    'wangan_lab.read_fixture': 'fs.read',
+    'wangan_lab.write_artifact': 'fs.write',
+    'wangan_lab.simulate_command': 'exec',
+    'wangan_lab.simulate_request': 'net.fetch',
+  };
+
   /**
    * 会话上下文存储
    * Map<sessionId, SessionContext>
@@ -75,7 +92,7 @@ export class RequestInterceptor {
     if (method === MCP_METHODS.TOOLS_CALL) {
       const extracted = McpTransport.extractToolCall(rawRequest);
       if (extracted) {
-        toolName = extracted.toolName;
+        toolName = RequestInterceptor.AGENT_LAB_TOOL_ALIASES[extracted.toolName] ?? extracted.toolName;
         toolArgs = extracted.toolArgs;
       }
     }
@@ -103,6 +120,9 @@ export class RequestInterceptor {
       agentPlanSteps: session.planSteps,
       conversationHistory: session.conversationHistory,
       timestamp: Date.now(),
+      sourceIds: [],
+      sessionSensitiveData: [],
+      sensitiveSourceIds: [],
     };
   }
 

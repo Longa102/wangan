@@ -3,6 +3,16 @@
 # 覆盖工具：net.fetch, net.request, net.websocket 等
 
 policies:
+  # ---- 已读取敏感数据的跨工具外发阻断 ----
+  # session_sensitive_data 由代理按“读取来源 → 本次请求体实际引用”建立，
+  # 不依赖请求体中必须出现某一种固定密钥格式。
+  - id: net-fetch-session-sensitive-dataflow
+    tool: net.fetch
+    rule: session_sensitive_data contains ("credential") OR session_sensitive_data contains ("sensitive-file")
+    action: BLOCK
+    risk: CRITICAL
+    message: "阻断：当前网络请求携带会话内从敏感来源读取的数据"
+
   # ---- 会话敏感数据外发阻断 ----
   - id: net-fetch-data-exfil
     tool: net.fetch

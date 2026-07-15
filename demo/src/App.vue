@@ -4,13 +4,27 @@ import StatsPanel from './components/StatsPanel.vue'
 import ScenarioRunner from './components/ScenarioRunner.vue'
 import ResultFeed from './components/ResultFeed.vue'
 import DetailPanel from './components/DetailPanel.vue'
+import AgentLabPanel from './components/AgentLabPanel.vue'
 
 const API = ''
+
+interface ChainNode {
+  id: string; agent: string; role: string; tool: string; desc: string
+  suspicious: boolean; isAttackSource: boolean; depth: number
+  sourceType?: string; sourceId?: string; sourceSnippet?: string
+  tokenRange?: { start: number; end: number }
+}
+
+interface ChainTrace {
+  nodes: ChainNode[]; mermaidCode: string; summary: string
+  impacted: { files: string[]; networkTargets: string[]; gitRepos: string[]; credentials: string[] }
+  timeline: Array<{ time: string; nodeId: string; desc: string; suspicious: boolean }>
+}
 
 interface LogEntry {
   id: string; scenario: string; action: string; risk: number
   injectionType: string; confidence: number; explanation: string; timestamp: number
-  latency?: number; rawResponse?: unknown; chainTrace?: unknown
+  latency?: number; rawResponse?: unknown; chainTrace?: ChainTrace
 }
 
 const logs = ref<LogEntry[]>([])
@@ -25,7 +39,7 @@ async function fetchLogs() { const r = await fetch(`${API}/api/logs`); logs.valu
 async function runScenario(id: string) {
   loading.value = true
   const r = await fetch(`${API}/api/run/${id}`, { method: 'POST' })
-  const entry = await r.json()
+  const entry = await r.json() as LogEntry
   logs.value.unshift(entry)
   if (logs.value.length > 100) logs.value.length = 100
   await fetchStats()
@@ -66,6 +80,9 @@ onMounted(() => { fetchStats(); fetchLogs() })
 
     <!-- 统计卡片 -->
     <StatsPanel :stats="stats" />
+
+    <!-- 真实 Copilot Agent 实验室 -->
+    <AgentLabPanel />
 
     <!-- 主内容区 -->
     <div class="main-content">

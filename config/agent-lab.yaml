@@ -1,0 +1,13 @@
+# 真实 Agent 集成演示的本地配置。
+# 上游只允许访问仓库内 sandbox/，exec 与 net.fetch 均为 dry-run。
+proxy:
+  upstream_mcp_url: "http://127.0.0.1:9100"
+  listen_port: 9001
+  listen_host: "127.0.0.1"
+
+policy:
+  rules_dir: "./src/policy/policies"
+  default_action: "ASK_USER"
+
+tracing:
+  audit_log_path: "./logs/agent-lab-audit.jsonl"

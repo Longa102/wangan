@@ -64,10 +64,11 @@ export class DecisionEngine {
       );
     }
 
-    // 规则 4：策略匹配到 HIGH 或 CRITICAL → 直接阻断
+    // 规则 4：明确配置为 BLOCK 的 HIGH/CRITICAL 策略 → 直接阻断。
+    // 风险等级用于排序和评分，不能覆盖策略作者指定的 ASK_USER 动作。
     if (policyEval.matched && policyEval.matchedRule) {
       const risk = policyEval.matchedRule.risk;
-      if (risk === 'CRITICAL' || risk === 'HIGH') {
+      if (policyEval.action === 'BLOCK' && (risk === 'CRITICAL' || risk === 'HIGH')) {
         const riskScore = this.computeRiskScore(detection.confidence, devScore, policyEval.matchedRule);
         return this.buildResult(
           'BLOCK',
@@ -121,6 +122,7 @@ export class DecisionEngine {
     // 规则 2：不确定 → 询问用户
     if ((detection.isInjection && detection.confidence < 0.8) ||
         (devScore >= 0.3 && devScore <= 0.6) ||
+        policyEval.action === 'ASK_USER' ||
         (policyEval.matched && policyEval.matchedRule?.risk === 'MEDIUM')) {
 
       const risk = detection.confidence < 0.5 ? 'MEDIUM' : 'HIGH';

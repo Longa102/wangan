@@ -1,10 +1,29 @@
 <script setup lang="ts">
+interface ChainNode {
+  id: string; agent: string; role: string; tool: string; desc: string
+  suspicious: boolean; isAttackSource: boolean; depth: number
+  sourceType?: string; sourceId?: string; sourceSnippet?: string
+  tokenRange?: { start: number; end: number }
+}
+
+interface ChainTrace {
+  nodes: ChainNode[]; mermaidCode: string; summary: string
+  impacted: { files: string[]; networkTargets: string[]; gitRepos: string[]; credentials: string[] }
+  timeline: Array<{ time: string; nodeId: string; desc: string; suspicious: boolean }>
+}
+
+interface LogEntry {
+  id: string; scenario: string; action: string; risk: number; timestamp: number
+  injectionType: string; confidence: number; explanation: string
+  latency?: number; rawResponse?: unknown; chainTrace?: ChainTrace
+}
+
 defineProps<{
-  logs: Array<{ id: string; scenario: string; action: string; risk: number; timestamp: number; injectionType: string; confidence: number }>
+  logs: LogEntry[]
   selected: { id: string; timestamp: number } | null
   loading: boolean
 }>()
-const emit = defineEmits<{ select: [entry: unknown] }>()
+const emit = defineEmits<{ select: [entry: LogEntry] }>()
 
 function fmtTime(ts: number) { return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false }) }
 function riskColor(r: number) { return r > 70 ? 'var(--danger)' : r > 30 ? 'var(--warning)' : 'var(--success)' }

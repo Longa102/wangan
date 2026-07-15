@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "wangan: start controlled MCP lab",
+      "type": "process",
+      "command": "${workspaceFolder}\\.tools\\node22\\node.exe",
+      "args": [
+        "${workspaceFolder}\\node_modules\\ts-node\\dist\\bin.js",
+        "--transpile-only",
+        "${workspaceFolder}\\scripts\\controlled-mcp-server.ts"
+      ],
+      "isBackground": true,
+      "problemMatcher": []
+    },
+    {
+      "label": "wangan: start full customer demo",
+      "type": "process",
+      "command": "powershell.exe",
+      "args": [
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${workspaceFolder}\\scripts\\start-agent-lab.ps1",
+        "-NoCode"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

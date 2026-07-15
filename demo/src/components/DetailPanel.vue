@@ -24,7 +24,6 @@ const activeTab = ref<'dag' | 'timeline'>('dag')
 
 const actionColors: Record<string, string> = { BLOCK: 'var(--danger)', ASK_USER: 'var(--warning)', ALLOW: 'var(--success)' }
 const actionLabels: Record<string, string> = { BLOCK: '已阻断', ASK_USER: '待确认', ALLOW: '已放行' }
-const actionBgs: Record<string, string> = { BLOCK: 'var(--danger-bg)', ASK_USER: 'var(--warning-bg)', ALLOW: 'var(--success-bg)' }
 
 const overview = computed(() => {
   const total = props.logs.length
@@ -134,7 +133,7 @@ function injectionLabel(t: string) {
       <!-- 攻击链溯源 -->
       <div v-if="entry.chainTrace" class="chain-section">
         <div class="chain-tabs">
-          <button class="chain-tab" :class="{active:activeTab==='dag'}" @click="activeTab='dag';nextTick(renderDag)">
+          <button class="chain-tab" :class="{active:activeTab==='dag'}" @click="activeTab='dag'">
             🔗 攻击路径 DAG
           </button>
           <button class="chain-tab" :class="{active:activeTab==='timeline'}" @click="activeTab='timeline'">

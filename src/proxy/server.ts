@@ -59,70 +59,8 @@ function startStdioServer(config: ProxyConfig): void {
       return null; // 忽略通知和非请求消息
     }
 
-    const method = msg.method;
-
     try {
-      switch (method) {
-        case MCP_METHODS.INITIALIZE: {
-          // initialize 请求 — 返回代理的能力声明
-          return McpTransport.createSuccessResponse(msg.id, {
-            protocolVersion: '2024-11-05',
-            capabilities: {
-              tools: {},
-              resources: {},
-              prompts: {},
-            },
-            serverInfo: {
-              name: 'mcp-security-proxy',
-              version: '1.0.0',
-            },
-          });
-        }
-
-        case MCP_METHODS.TOOLS_LIST: {
-          // tools/list — 转发到上游，获取真实工具列表
-          try {
-            const upstreamResponse = await proxy['upstreamClient'].forward(msg);
-            return upstreamResponse;
-          } catch {
-            return McpTransport.createErrorResponse(
-              msg.id,
-              MCP_ERROR_CODES.INTERNAL_ERROR,
-              'Failed to fetch tool list from upstream MCP server'
-            );
-          }
-        }
-
-        case MCP_METHODS.TOOLS_CALL: {
-          // tools/call — 核心拦截点，走完整安全管道
-          return await proxy.handleToolCall(msg, SESSION_ID);
-        }
-
-        case MCP_METHODS.RESOURCES_LIST:
-        case MCP_METHODS.RESOURCES_READ:
-        case MCP_METHODS.PROMPTS_LIST:
-        case MCP_METHODS.PROMPTS_GET: {
-          // 资源/提示词读取 — 转发到上游
-          try {
-            const upstreamResponse = await proxy['upstreamClient'].forward(msg);
-            return upstreamResponse;
-          } catch {
-            return McpTransport.createErrorResponse(
-              msg.id,
-              MCP_ERROR_CODES.INTERNAL_ERROR,
-              `Failed to forward ${method} to upstream MCP server`
-            );
-          }
-        }
-
-        default: {
-          return McpTransport.createErrorResponse(
-            msg.id,
-            MCP_ERROR_CODES.METHOD_NOT_FOUND,
-            `Unknown method: ${method}`
-          );
-        }
-      }
+      return await proxy.handleMcpRequest(msg, SESSION_ID);
     } catch (err) {
       return McpTransport.createErrorResponse(
         msg.id,
@@ -185,7 +123,7 @@ function startHttpServer(config: ProxyConfig): void {
         proxy.updateSession(sessionId, userIntent);
       }
 
-      const response = await proxy.handleToolCall(request, sessionId);
+      const response = await proxy.handleMcpRequest(request, sessionId);
 
       const httpResponse = HttpTransport.serializeHttpResponse(response);
       res.writeHead(httpResponse.statusCode, {

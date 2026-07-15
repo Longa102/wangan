@@ -1,0 +1,18 @@
+{
+  "servers": {
+    "wangan-agent-lab": {
+      "type": "stdio",
+      "command": "${workspaceFolder}\\.tools\\node22\\node.exe",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "${workspaceFolder}\\node_modules\\ts-node\\dist\\bin.js",
+        "--transpile-only",
+        "${workspaceFolder}\\src\\proxy\\server.ts",
+        "--mode",
+        "stdio",
+        "--config",
+        "${workspaceFolder}\\config\\agent-lab.yaml"
+      ]
+    }
+  }
+}

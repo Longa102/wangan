@@ -292,6 +292,27 @@ describe('DecisionEngine', () => {
     expect(result.action).toBe('ASK_USER');
   });
 
+  it('should preserve an explicit ASK_USER action even for a high-risk policy', () => {
+    const result = engine.evaluate(
+      makeDetection(),
+      makeDeviation(),
+      makePolicyEval({
+        matched: true,
+        action: 'ASK_USER',
+        matchedRule: {
+          id: 'net-fetch-untrusted-domain',
+          tool: 'net.fetch',
+          rule: 'target_url not_in trusted_domains_list',
+          action: 'ASK_USER' as const,
+          risk: 'HIGH' as const,
+          message: '需要用户确认',
+          enabled: true,
+        },
+      }),
+    );
+    expect(result.action).toBe('ASK_USER');
+  });
+
   it('should generate explainable conclusion', () => {
     const result = engine.evaluate(
       makeDetection({
